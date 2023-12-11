@@ -5,7 +5,7 @@
  * Copyright (C) 2016 Linaro Ltd
  * Copyright (C) 2014 Sony Mobile Communications AB
  * Copyright (c) 2012-2013, 2020-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/clk.h>
@@ -41,7 +41,6 @@
 #define XO_FREQ		19200000
 #define PIL_TZ_AVG_BW	UINT_MAX
 #define PIL_TZ_PEAK_BW	UINT_MAX
-#define QMP_MSG_LEN	64
 
 static struct icc_path *scm_perf_client;
 static int scm_pas_bw_count;
@@ -142,6 +141,21 @@ void adsp_segment_dump(struct rproc *rproc, struct rproc_dump_segment *segment,
 {
 	struct qcom_adsp *adsp = rproc->priv;
 	int total_offset;
+	void __iomem *base;
+	int len = strlen("md_dbg_buf");
+
+	if (strnlen(segment->priv, len + 1) == len &&
+		    !strcmp(segment->priv, "md_dbg_buf")) {
+		base = ioremap((unsigned long)le64_to_cpu(segment->da), size);
+		if (!base) {
+			pr_err("failed to map md_dbg_buf region\n");
+			return;
+		}
+
+		memcpy_fromio(dest, base, size);
+		iounmap(base);
+		return;
+	}
 
 	total_offset = segment->da + segment->offset + offset - adsp->mem_phys;
 	if (total_offset < 0 || total_offset + size > adsp->mem_size) {
@@ -168,16 +182,6 @@ static void adsp_minidump(struct rproc *rproc)
 
 exit:
 	trace_rproc_qcom_event(dev_name(adsp->dev), "adsp_minidump", "exit");
-}
-
-static int adsp_toggle_load_state(struct qmp *qmp, const char *name, bool enable)
-{
-	char buf[QMP_MSG_LEN] = {};
-
-	snprintf(buf, sizeof(buf),
-		 "{class: image, res: load_state, name: %s, val: %s}",
-		 name, enable ? "on" : "off");
-	return qmp_send(qmp, buf, sizeof(buf));
 }
 
 static int adsp_pds_enable(struct qcom_adsp *adsp, struct device **pds,
@@ -337,7 +341,7 @@ static void disable_regulators(struct qcom_adsp *adsp)
 {
 	int i;
 
-	for (i = 0; i < adsp->reg_cnt; i++) {
+	for (i = (adsp->reg_cnt - 1); i >= 0; i--) {
 		regulator_set_voltage(adsp->regs[i].reg, 0, INT_MAX);
 		regulator_set_load(adsp->regs[i].reg, 0);
 		regulator_disable(adsp->regs[i].reg);
@@ -383,6 +387,71 @@ static int do_bus_scaling(struct qcom_adsp *adsp, bool enable)
 	return rc;
 }
 
+static int qcom_rproc_alloc_dtb_firmware(struct qcom_adsp *adsp,
+					const char *dtb_firmware)
+{
+	const char *p;
+
+	if (!adsp)
+		return -EINVAL;
+
+	if (!dtb_firmware)
+		return 0;
+
+	p = kstrdup_const(dtb_firmware, GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+	adsp->dtb_fw_name = p;
+
+	return 0;
+}
+
+int qcom_rproc_set_dtb_firmware(struct rproc *rproc, const char *dtb_fw_name)
+{
+	struct qcom_adsp *adsp;
+	struct device *dev;
+	int ret, len;
+	char *p;
+
+	if (!rproc || !dtb_fw_name)
+		return -EINVAL;
+
+	dev = rproc->dev.parent;
+	adsp = (struct qcom_adsp *)rproc->priv;
+	ret = mutex_lock_interruptible(&rproc->lock);
+	if (ret) {
+		dev_err(dev, "can't lock rproc %s: %d\n", rproc->name, ret);
+		return -EINVAL;
+	}
+
+	if (rproc->state != RPROC_OFFLINE) {
+		dev_err(dev, "can't change firmware while running\n");
+		ret = -EBUSY;
+		goto out;
+	}
+
+	len = strcspn(dtb_fw_name, "\n");
+	if (!len) {
+		dev_err(dev, "can't provide empty string for DTB firmware name\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	p = kstrndup(dtb_fw_name, len, GFP_KERNEL);
+	if (!p) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	if (adsp->dtb_fw_name)
+		kfree_const(adsp->dtb_fw_name);
+	adsp->dtb_fw_name = p;
+
+out:
+	mutex_unlock(&rproc->lock);
+	return ret;
+}
+EXPORT_SYMBOL(qcom_rproc_set_dtb_firmware);
+
 static int adsp_start(struct rproc *rproc)
 {
 	struct qcom_adsp *adsp = (struct qcom_adsp *)rproc->priv;
@@ -406,7 +475,7 @@ static int adsp_start(struct rproc *rproc)
 		goto disable_active_pds;
 
 	if (adsp->qmp) {
-		ret = adsp_toggle_load_state(adsp->qmp, adsp->qmp_name, true);
+		ret = qcom_rproc_toggle_load_state(adsp->qmp, adsp->qmp_name, true);
 		if (ret)
 			goto disable_proxy_pds;
 	}
@@ -481,7 +550,7 @@ free_metadata:
 	qcom_mdt_free_metadata(adsp->dev, adsp->pas_id, adsp->mdata,
 					adsp->dma_phys_below_32b, ret);
 free_firmware:
-	if (!fw)
+	if (fw)
 		release_firmware(fw);
 
 free_metadata_dtb:
@@ -502,7 +571,7 @@ disable_xo_clk:
 	clk_disable_unprepare(adsp->xo);
 disable_load_state:
 	if (adsp->qmp)
-		adsp_toggle_load_state(adsp->qmp, adsp->qmp_name, false);
+		qcom_rproc_toggle_load_state(adsp->qmp, adsp->qmp_name, false);
 disable_proxy_pds:
 	adsp_pds_disable(adsp, adsp->proxy_pds, adsp->proxy_pd_count);
 disable_active_pds:
@@ -556,7 +625,7 @@ static int adsp_stop(struct rproc *rproc)
 	scm_pas_disable_bw();
 	adsp_pds_disable(adsp, adsp->active_pds, adsp->active_pd_count);
 	if (adsp->qmp)
-		adsp_toggle_load_state(adsp->qmp, adsp->qmp_name, false);
+		qcom_rproc_toggle_load_state(adsp->qmp, adsp->qmp_name, false);
 	handover = qcom_q6v5_unprepare(&adsp->q6v5);
 	if (handover)
 		qcom_pas_handover(&adsp->q6v5);
@@ -604,7 +673,7 @@ begin_attach:
 	if (ret < 0)
 		goto disable_active_pds;
 
-	ret = adsp_toggle_load_state(adsp->qmp, adsp->qmp_name, true);
+	ret = qcom_rproc_toggle_load_state(adsp->qmp, adsp->qmp_name, true);
 	if (ret)
 		goto disable_proxy_pds;
 
@@ -653,7 +722,7 @@ disable_aggre2_clk:
 disable_xo_clk:
 	clk_disable_unprepare(adsp->xo);
 disable_load_state:
-	adsp_toggle_load_state(adsp->qmp, adsp->qmp_name, false);
+	qcom_rproc_toggle_load_state(adsp->qmp, adsp->qmp_name, false);
 disable_proxy_pds:
 	adsp_pds_disable(adsp, adsp->proxy_pds, adsp->proxy_pd_count);
 disable_active_pds:
@@ -869,6 +938,7 @@ static int adsp_alloc_memory_region(struct qcom_adsp *adsp)
 	}
 
 	ret = of_address_to_resource(node, 0, &r);
+	of_node_put(node);
 	if (ret)
 		return ret;
 
@@ -1021,7 +1091,9 @@ static int adsp_probe(struct platform_device *pdev)
 	adsp->minidump_id = desc->minidump_id;
 	adsp->pas_id = desc->pas_id;
 	adsp->dtb_pas_id = desc->dtb_pas_id;
-	adsp->dtb_fw_name = desc->dtb_firmware_name;
+	ret = qcom_rproc_alloc_dtb_firmware(adsp, desc->dtb_firmware_name);
+	if (ret)
+		goto free_rproc;
 	adsp->has_aggre2_clk = desc->has_aggre2_clk;
 	adsp->info_name = desc->sysmon_name;
 	adsp->qmp_name = desc->qmp_name;
@@ -1035,7 +1107,7 @@ static int adsp_probe(struct platform_device *pdev)
 
 	ret = device_init_wakeup(adsp->dev, true);
 	if (ret)
-		goto free_rproc;
+		goto free_dtb_firmware;
 
 	ret = adsp_alloc_memory_region(adsp);
 	if (ret)
@@ -1128,7 +1200,11 @@ detach_active_pds:
 	adsp_pds_detach(adsp, adsp->active_pds, adsp->active_pd_count);
 deinit_wakeup_source:
 	device_init_wakeup(adsp->dev, false);
+free_dtb_firmware:
+	if (adsp->dtb_fw_name)
+		kfree_const(adsp->dtb_fw_name);
 free_rproc:
+	device_init_wakeup(adsp->dev, false);
 	rproc_free(rproc);
 
 	return ret;
@@ -1138,6 +1214,8 @@ static int adsp_remove(struct platform_device *pdev)
 {
 	struct qcom_adsp *adsp = platform_get_drvdata(pdev);
 
+	if (adsp->dtb_fw_name)
+		kfree_const(adsp->dtb_fw_name);
 	rproc_del(adsp->rproc);
 	if (adsp->minidump_dev)
 		qcom_destroy_ramdump_device(adsp->minidump_dev);
@@ -1146,6 +1224,7 @@ static int adsp_remove(struct platform_device *pdev)
 	qcom_remove_sysmon_subdev(adsp->sysmon);
 	qcom_remove_smd_subdev(adsp->rproc, &adsp->smd_subdev);
 	qcom_remove_ssr_subdev(adsp->rproc, &adsp->ssr_subdev);
+	adsp_pds_detach(adsp, adsp->proxy_pds, adsp->proxy_pd_count);
 	device_init_wakeup(adsp->dev, false);
 	rproc_free(adsp->rproc);
 
@@ -1167,12 +1246,27 @@ static const struct adsp_data sm8150_adsp_resource = {
 		.crash_reason_smem = 423,
 		.firmware_name = "adsp.mdt",
 		.pas_id = 1,
+		.minidump_id = 5,
+		.uses_elf64 = true,
 		.has_aggre2_clk = false,
 		.auto_boot = true,
 		.ssr_name = "lpass",
 		.sysmon_name = "adsp",
 		.qmp_name = "adsp",
 		.ssctl_id = 0x14,
+};
+
+static const struct adsp_data sm8150_mpss_resource = {
+	.crash_reason_smem = 421,
+	.firmware_name = "modem.mdt",
+	.pas_id = 4,
+	.minidump_id = 3,
+	.has_aggre2_clk = false,
+	.auto_boot = true,
+	.ssr_name = "mpss",
+	.qmp_name = "modem",
+	.sysmon_name = "modem",
+	.ssctl_id = 0x12,
 };
 
 static const struct adsp_data sm8250_adsp_resource = {
@@ -1230,6 +1324,22 @@ static const struct adsp_data waipio_adsp_resource = {
 };
 
 static const struct adsp_data kalama_adsp_resource = {
+	.crash_reason_smem = 423,
+	.firmware_name = "adsp.mdt",
+	.dtb_firmware_name = "adsp_dtb.mdt",
+	.pas_id = 1,
+	.dtb_pas_id = 0x24,
+	.minidump_id = 5,
+	.uses_elf64 = true,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
+	.ssr_name = "lpass",
+	.sysmon_name = "adsp",
+	.qmp_name = "adsp",
+	.ssctl_id = 0x14,
+};
+
+static const struct adsp_data crow_adsp_resource = {
 	.crash_reason_smem = 423,
 	.firmware_name = "adsp.mdt",
 	.dtb_firmware_name = "adsp_dtb.mdt",
@@ -1363,6 +1473,22 @@ static const struct adsp_data kalama_cdsp_resource = {
 	.ssctl_id = 0x17,
 };
 
+static const struct adsp_data crow_cdsp_resource = {
+	.crash_reason_smem = 601,
+	.firmware_name = "cdsp.mdt",
+	.dtb_firmware_name = "cdsp_dtb.mdt",
+	.pas_id = 18,
+	.dtb_pas_id = 0x25,
+	.minidump_id = 7,
+	.uses_elf64 = true,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
+	.ssr_name = "cdsp",
+	.sysmon_name = "cdsp",
+	.qmp_name = "cdsp",
+	.ssctl_id = 0x17,
+};
+
 static const struct adsp_data khaje_cdsp_resource = {
 	.crash_reason_smem = 601,
 	.firmware_name = "cdsp.mdt",
@@ -1422,6 +1548,22 @@ static const struct adsp_data kalama_mpss_resource = {
 	.has_aggre2_clk = false,
 	.auto_boot = false,
 	.needs_dsm_mem_setup = true,
+	.ssr_name = "mpss",
+	.sysmon_name = "modem",
+	.qmp_name = "modem",
+	.ssctl_id = 0x12,
+	.dma_phys_below_32b = true,
+};
+
+static const struct adsp_data crow_mpss_resource = {
+	.crash_reason_smem = 421,
+	.firmware_name = "modem.mdt",
+	.pas_id = 4,
+	.free_after_auth_reset = true,
+	.minidump_id = 3,
+	.uses_elf64 = true,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
 	.ssr_name = "mpss",
 	.sysmon_name = "modem",
 	.qmp_name = "modem",
@@ -1680,7 +1822,7 @@ static const struct adsp_data scuba_auto_lpass_resource = {
 };
 
 static const struct adsp_data lemans_adsp_resource = {
-	.crash_reason_smem = 2,
+	.crash_reason_smem = 423,
 	.firmware_name = "adsp.mdt",
 	.pas_id = 1,
 	.uses_elf64 = true,
@@ -1690,6 +1832,178 @@ static const struct adsp_data lemans_adsp_resource = {
 	.sysmon_name = "adsp",
 	.qmp_name = "adsp",
 	.ssctl_id = 0x14,
+};
+
+static const struct adsp_data lemans_cdsp_resource = {
+	.crash_reason_smem = 601,
+	.firmware_name = "cdsp0.mdt",
+	.pas_id = 18,
+	.uses_elf64 = true,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
+	.ssr_name = "cdsp",
+	.sysmon_name = "cdsp",
+	.qmp_name = "cdsp",
+	.ssctl_id = 0x17,
+};
+
+static const struct adsp_data lemans_cdsp1_resource = {
+	.crash_reason_smem = 633,
+	.firmware_name = "cdsp1.mdt",
+	.pas_id = 30,
+	.uses_elf64 = true,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
+	.ssr_name = "cdsp1",
+	.sysmon_name = "cdsp1",
+	.qmp_name = "cdsp1",
+	.ssctl_id = 0x20,
+};
+
+static const struct adsp_data lemans_gpdsp0_resource = {
+	.crash_reason_smem = 640,
+	.firmware_name = "gpdsp0.mdt",
+	.pas_id = 39,
+	.uses_elf64 = true,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
+	.ssr_name = "gpdsp0",
+	.sysmon_name = "gpdsp0",
+	.qmp_name = "gpdsp0",
+	.ssctl_id = 0x21,
+};
+
+static const struct adsp_data lemans_gpdsp1_resource = {
+	.crash_reason_smem = 641,
+	.firmware_name = "gpdsp1.mdt",
+	.pas_id = 40,
+	.uses_elf64 = true,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
+	.ssr_name = "gpdsp1",
+	.sysmon_name = "gpdsp1",
+	.qmp_name = "gpdsp1",
+	.ssctl_id = 0x22,
+};
+
+static const struct adsp_data kona_adsp_resource = {
+	.crash_reason_smem = 423,
+	.firmware_name = "adsp.mdt",
+	.pas_id = 1,
+	.has_aggre2_clk = false,
+	.auto_boot = true,
+	.ssr_name = "lpass",
+	.sysmon_name = "adsp",
+	.qmp_name = "adsp",
+	.ssctl_id = 0x14,
+};
+
+static const struct adsp_data kona_cdsp_resource = {
+	.crash_reason_smem = 601,
+	.firmware_name = "cdsp.mdt",
+	.pas_id = 18,
+	.has_aggre2_clk = false,
+	.auto_boot = true,
+	.ssr_name = "cdsp",
+	.sysmon_name = "cdsp",
+	.qmp_name = "cdsp",
+	.ssctl_id = 0x17,
+};
+
+static const struct adsp_data kona_slpi_resource = {
+	.crash_reason_smem = 424,
+	.firmware_name = "slpi.mdt",
+	.pas_id = 12,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
+	.ssr_name = "dsps",
+	.sysmon_name = "slpi",
+	.qmp_name = "slpi",
+	.ssctl_id = 0x16,
+};
+
+static const struct adsp_data crow_wpss_resource = {
+	.crash_reason_smem = 626,
+	.firmware_name = "wpss.mdt",
+	.pas_id = 6,
+	.minidump_id = 4,
+	.uses_elf64 = true,
+	.ssr_name = "wpss",
+	.sysmon_name = "wpss",
+	.qmp_name = "wpss",
+	.ssctl_id = 0x19,
+};
+
+static const struct adsp_data qcs405_adsp_resource = {
+	.crash_reason_smem = 423,
+	.firmware_name = "adsp.mdt",
+	.pas_id = 1,
+	.has_aggre2_clk = false,
+	.auto_boot = true,
+	.ssr_name = "lpass",
+	.sysmon_name = "adsp",
+	.qmp_name = "adsp",
+	.ssctl_id = 0x14,
+};
+
+static const struct adsp_data qcs405_cdsp_resource = {
+	.crash_reason_smem = 601,
+	.firmware_name = "cdsp.mdt",
+	.pas_id = 18,
+	.has_aggre2_clk = false,
+	.auto_boot = true,
+	.ssr_name = "cdsp",
+	.sysmon_name = "cdsp",
+	.qmp_name = "cdsp",
+	.ssctl_id = 0x17,
+};
+
+static const struct adsp_data qcs405_modem_resource = {
+	.crash_reason_smem = 421,
+	.firmware_name = "wcnss.mdt",
+	.pas_id = 6,
+	.has_aggre2_clk = false,
+	.auto_boot = false,
+	.ssr_name = "wcnss",
+	.sysmon_name = "wlan",
+	.qmp_name = "wlan",
+	.ssctl_id = 0x12,
+};
+
+static const struct adsp_data trinket_modem_resource = {
+	.crash_reason_smem = 421,
+	.firmware_name = "modem.mdt",
+	.pas_id = 4,
+	.free_after_auth_reset = true,
+	.minidump_id = 3,
+	.uses_elf64 = true,
+	.ssr_name = "mpss",
+	.sysmon_name = "modem",
+	.ssctl_id = 0x12,
+};
+
+static const struct adsp_data trinket_adsp_resource = {
+	.crash_reason_smem = 423,
+	.firmware_name = "adsp.mdt",
+	.pas_id = 1,
+	.has_aggre2_clk = false,
+	.auto_boot = true,
+	.ssr_name = "lpass",
+	.sysmon_name = "adsp",
+	.qmp_name = "adsp",
+	.ssctl_id = 0x14,
+};
+
+static const struct adsp_data trinket_cdsp_resource = {
+	.crash_reason_smem = 601,
+	.firmware_name = "cdsp.mdt",
+	.pas_id = 18,
+	.has_aggre2_clk = false,
+	.auto_boot = true,
+	.ssr_name = "cdsp",
+	.sysmon_name = "cdsp",
+	.qmp_name = "cdsp",
+	.ssctl_id = 0x17,
 };
 
 static const struct of_device_id adsp_of_match[] = {
@@ -1711,7 +2025,7 @@ static const struct of_device_id adsp_of_match[] = {
 	{ .compatible = "qcom,sdx55-mpss-pas", .data = &sdx55_mpss_resource},
 	{ .compatible = "qcom,sm8150-adsp-pas", .data = &sm8150_adsp_resource},
 	{ .compatible = "qcom,sm8150-cdsp-pas", .data = &sm8150_cdsp_resource},
-	{ .compatible = "qcom,sm8150-mpss-pas", .data = &mpss_resource_init},
+	{ .compatible = "qcom,sm8150-mpss-pas", .data = &sm8150_mpss_resource},
 	{ .compatible = "qcom,sm8150-slpi-pas", .data = &sm8150_slpi_resource},
 	{ .compatible = "qcom,sm8250-adsp-pas", .data = &sm8250_adsp_resource},
 	{ .compatible = "qcom,sm8250-cdsp-pas", .data = &sm8250_cdsp_resource},
@@ -1738,6 +2052,23 @@ static const struct of_device_id adsp_of_match[] = {
 	{ .compatible = "qcom,monaco-adsp-pas", .data = &monaco_adsp_resource},
 	{ .compatible = "qcom,monaco-modem-pas", .data = &monaco_modem_resource},
 	{ .compatible = "qcom,lemans-adsp-pas", .data = &lemans_adsp_resource},
+	{ .compatible = "qcom,lemans-cdsp-pas", .data = &lemans_cdsp_resource},
+	{ .compatible = "qcom,lemans-cdsp1-pas", .data = &lemans_cdsp1_resource},
+	{ .compatible = "qcom,lemans-gpdsp0-pas", .data = &lemans_gpdsp0_resource},
+	{ .compatible = "qcom,lemans-gpdsp1-pas", .data = &lemans_gpdsp1_resource},
+	{ .compatible = "qcom,kona-adsp-pas", .data = &kona_adsp_resource},
+	{ .compatible = "qcom,kona-cdsp-pas", .data = &kona_cdsp_resource},
+	{ .compatible = "qcom,kona-slpi-pas", .data = &kona_slpi_resource},
+	{ .compatible = "qcom,crow-wpss-pas", .data = &crow_wpss_resource},
+	{ .compatible = "qcom,crow-adsp-pas", .data = &crow_adsp_resource},
+	{ .compatible = "qcom,crow-cdsp-pas", .data = &crow_cdsp_resource},
+	{ .compatible = "qcom,crow-modem-pas", .data = &crow_mpss_resource},
+	{ .compatible = "qcom,qcs405-adsp-pas", .data = &qcs405_adsp_resource},
+	{ .compatible = "qcom,qcs405-wlan-dsp", .data = &qcs405_modem_resource},
+	{ .compatible = "qcom,qcs405-cdsp-pas", .data = &qcs405_cdsp_resource},
+	{ .compatible = "qcom,trinket-modem-pas", .data = &trinket_modem_resource},
+	{ .compatible = "qcom,trinket-adsp-pas", .data = &trinket_adsp_resource},
+	{ .compatible = "qcom,trinket-cdsp-pas", .data = &trinket_cdsp_resource},
 	{ },
 };
 MODULE_DEVICE_TABLE(of, adsp_of_match);

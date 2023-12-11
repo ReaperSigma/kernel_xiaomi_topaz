@@ -635,7 +635,7 @@ static int clk_debug_khaje_probe(struct platform_device *pdev)
 	for (i = 0; i < ARRAY_SIZE(mux_list); i++) {
 		ret = devm_clk_register_debug_mux(&pdev->dev, mux_list[i].mux);
 		if (ret) {
-			dev_err(&pdev->dev, "Unable to register mux clk %s, err:(%d)",
+			dev_err(&pdev->dev, "Unable to register mux clk %s, err:(%d)\n",
 				clk_hw_get_name(&mux_list[i].mux->hw),
 				ret);
 			return ret;

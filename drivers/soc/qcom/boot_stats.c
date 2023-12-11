@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2013-2019, 2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/kernel.h>
@@ -40,17 +40,18 @@
 struct boot_stats {
 	uint32_t bootloader_start;
 	uint32_t bootloader_end;
-	uint32_t bootloader_display;
-	uint32_t bootloader_load_kernel;
-#ifdef CONFIG_MSM_BOOT_TIME_MARKER
-	uint32_t bootloader_load_kernel_start;
-	uint32_t bootloader_load_kernel_end;
-#endif
+	uint32_t bootloader_load_boot_start;
+	uint32_t bootloader_load_boot_end;
+	uint32_t bootloader_load_vendor_boot_start;
+	uint32_t bootloader_load_vendor_boot_end;
+	uint32_t bootloader_load_init_boot_start;
+	uint32_t bootloader_load_init_boot_end;
 } __packed;
 
 static void __iomem *mpm_counter_base;
 static uint32_t mpm_counter_freq;
 static struct boot_stats __iomem *boot_stats;
+static void __iomem *mpm_hr_counter_base;
 
 #ifdef CONFIG_MSM_BOOT_TIME_MARKER
 
@@ -155,6 +156,26 @@ unsigned long long msm_timer_get_sclk_ticks(void)
 	}
 	return t1;
 }
+EXPORT_SYMBOL(msm_timer_get_sclk_ticks);
+
+unsigned long long msm_hr_timer_get_sclk_ticks(void)
+{
+	unsigned long long tl, th;
+	void __iomem *sclk_tick_high;
+	void __iomem *sclk_tick_low;
+
+	if (!mpm_hr_counter_base)
+		return -EINVAL;
+
+	sclk_tick_high = mpm_hr_counter_base + 0xc;
+	sclk_tick_low = mpm_hr_counter_base + 0x8;
+
+	tl = readl_relaxed(sclk_tick_low);
+	th = readl_relaxed(sclk_tick_high);
+
+	return (th << 32) | tl;
+}
+EXPORT_SYMBOL(msm_hr_timer_get_sclk_ticks);
 
 static void _destroy_boot_marker(const char *name)
 {
@@ -275,21 +296,42 @@ EXPORT_SYMBOL(destroy_marker);
 
 static void set_bootloader_stats(void)
 {
+	unsigned long long ts1, ts2;
+
 	if (IS_ERR_OR_NULL(boot_stats)) {
 		pr_err("boot_marker: imem not initialized!\n");
 		return;
 	}
 
 	_create_boot_marker("M - APPSBL Start - ",
-		readl_relaxed(&boot_stats->bootloader_start));
-	_create_boot_marker("M - APPSBL Kernel Load Start - ",
-		readl_relaxed(&boot_stats->bootloader_load_kernel_start));
-	_create_boot_marker("M - APPSBL Kernel Load End - ",
-		readl_relaxed(&boot_stats->bootloader_load_kernel_end));
-	_create_boot_marker("D - APPSBL Kernel Load Time - ",
-		readl_relaxed(&boot_stats->bootloader_load_kernel));
+			readl_relaxed(&boot_stats->bootloader_start));
+
+	ts1 = readl_relaxed(&boot_stats->bootloader_load_boot_start);
+	if (ts1) {
+		_create_boot_marker("M - APPSBL Boot Load Start - ", ts1);
+		ts2 = readl_relaxed(&boot_stats->bootloader_load_boot_end);
+		_create_boot_marker("M - APPSBL Boot Load End - ", ts2);
+		_create_boot_marker("D - APPSBL Boot Load Time - ", ts2 - ts1);
+	}
+
+	ts1 = readl_relaxed(&boot_stats->bootloader_load_vendor_boot_start);
+	if (ts1) {
+		_create_boot_marker("M - APPSBL Vendor Boot Load Start - ", ts1);
+		ts2 = readl_relaxed(&boot_stats->bootloader_load_vendor_boot_end);
+		_create_boot_marker("M - APPSBL Vendor Boot Load End - ", ts2);
+		_create_boot_marker("D - APPSBL Vendor Boot Load Time - ", ts2 - ts1);
+	}
+
+	ts1 = readl_relaxed(&boot_stats->bootloader_load_init_boot_start);
+	if (ts1) {
+		_create_boot_marker("M - APPSBL Init Boot Load Start - ", ts1);
+		ts2 = readl_relaxed(&boot_stats->bootloader_load_init_boot_end);
+		_create_boot_marker("M - APPSBL Init Boot Load End - ", ts2);
+		_create_boot_marker("D - APPSBL Init Load Time - ", ts2 - ts1);
+	}
+
 	_create_boot_marker("M - APPSBL End - ",
-		readl_relaxed(&boot_stats->bootloader_end));
+			readl_relaxed(&boot_stats->bootloader_end));
 }
 
 static ssize_t bootkpi_reader(struct file *fp, struct kobject *obj,
@@ -297,7 +339,7 @@ static ssize_t bootkpi_reader(struct file *fp, struct kobject *obj,
 		size_t count)
 {
 	struct boot_marker *marker;
-	unsigned long ts_whole_num, ts_precision;
+	unsigned long long ts_whole_num, ts_precision;
 	static char *kpi_buf;
 	static int temp;
 	int ret = 0;
@@ -452,7 +494,7 @@ static void exit_bootkpi(void)
 
 static int mpm_parse_dt(void)
 {
-	struct device_node *np_imem, *np_mpm2;
+	struct device_node *np_imem, *np_mpm2, *np_mpm_hr;
 
 	np_imem = of_find_compatible_node(NULL, NULL,
 				"qcom,msm-imem-boot_stats");
@@ -485,8 +527,24 @@ static int mpm_parse_dt(void)
 	} else
 		goto err2;
 
-	return 0;
+	/* qcom,mpm-hr-counter is not mandatory */
+	np_mpm_hr = of_find_compatible_node(NULL, NULL,
+				"qcom,mpm-hr-counter");
+	if (!np_mpm_hr) {
+		pr_info("mpm_hr_counter: can't find DT node\n");
+		return 0;
+	}
 
+	if (of_get_address(np_mpm_hr, 0, NULL, NULL)) {
+		mpm_hr_counter_base = of_iomap(np_mpm_hr, 0);
+		if (!mpm_hr_counter_base) {
+			pr_err("mpm_hr_counter: cant map counter base\n");
+			of_node_put(np_mpm_hr);
+		}
+	} else
+		of_node_put(np_mpm_hr);
+
+	return 0;
 err2:
 	of_node_put(np_mpm2);
 err1:
@@ -500,10 +558,9 @@ static void print_boot_stats(void)
 		readl_relaxed(&boot_stats->bootloader_start));
 	pr_info("KPI: Bootloader end count = %u\n",
 		readl_relaxed(&boot_stats->bootloader_end));
-	pr_info("KPI: Bootloader display count = %u\n",
-		readl_relaxed(&boot_stats->bootloader_display));
 	pr_info("KPI: Bootloader load kernel count = %u\n",
-		readl_relaxed(&boot_stats->bootloader_load_kernel));
+		readl_relaxed(&boot_stats->bootloader_load_boot_end) -
+		readl_relaxed(&boot_stats->bootloader_load_boot_start));
 	pr_info("KPI: Kernel MPM timestamp = %u\n",
 		readl_relaxed(mpm_counter_base));
 	pr_info("KPI: Kernel MPM Clock frequency = %u\n",
@@ -531,6 +588,8 @@ static int __init boot_stats_init(void)
 	} else {
 		iounmap(boot_stats);
 		iounmap(mpm_counter_base);
+		if (mpm_hr_counter_base)
+			iounmap(mpm_hr_counter_base);
 	}
 
 	return 0;
@@ -543,6 +602,8 @@ static void __exit boot_stats_exit(void)
 		exit_bootkpi();
 		iounmap(boot_stats);
 		iounmap(mpm_counter_base);
+		if (mpm_hr_counter_base)
+			iounmap(mpm_hr_counter_base);
 	}
 }
 module_exit(boot_stats_exit)
