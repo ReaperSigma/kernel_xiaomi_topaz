@@ -646,9 +646,9 @@ build() {
 		exit
 	fi
 
-	run "make CC='ccache clang-14' CXX='ccache clang++-14' LLVM=1 LLVM_IAS=1 O=out $KERNEL_CONFIG"
-	run "make CC='ccache clang-14' CXX='ccache clang++-14' LLVM=1 LLVM_IAS=1 O=out -j8"
-	run "make CC='ccache clang-14' CXX='ccache clang++-14' LLVM=1 LLVM_IAS=1 O=out $KERNEL_CONFIG ARCH=$TARGET_ARCH INSTALL_MOD_PATH=\"$BUILD_MODULES_DIR\" INSTALL_MOD_STRIP=1 modules_install"
+	run "make CC='ccache clang-14' CXX='ccache clang++-14' LLVM=1 LLVM_IAS=1 LD=ld.lld-14 HOSTLD=ld.lld-14 AR=llvm-ar-14 AS=llvm-as-14 STRIP=llvm-strip-14 OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 NM=llvm-nm-14 HOSTAR=llvm-ar-14 HOSTAS=llvm-as-14  O=out $KERNEL_CONFIG"
+	run "make CC='ccache clang-14' CXX='ccache clang++-14' LLVM=1 LLVM_IAS=1 LD=ld.lld-14 HOSTLD=ld.lld-14 AR=llvm-ar-14 AS=llvm-as-14 STRIP=llvm-strip-14 OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 NM=llvm-nm-14 HOSTAR=llvm-ar-14 HOSTAS=llvm-as-14 O=out -j8"
+	run "make CC='ccache clang-14' CXX='ccache clang++-14' LLVM=1 LLVM_IAS=1 LD=ld.lld-14 HOSTLD=ld.lld-14 AR=llvm-ar-14 AS=llvm-as-14 STRIP=llvm-strip-14 OBJCOPY=llvm-objcopy-14 OBJDUMP=llvm-objdump-14 NM=llvm-nm-14 HOSTAR=llvm-ar-14 HOSTAS=llvm-as-14  O=out $KERNEL_CONFIG ARCH=$TARGET_ARCH INSTALL_MOD_PATH=\"$BUILD_MODULES_DIR\" INSTALL_MOD_STRIP=1 modules_install"
 	if [[ $BUILD_HAS_DTBO == "1" ]]; then
 		make_dtboimg
 	fi
