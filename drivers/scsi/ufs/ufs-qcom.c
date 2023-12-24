@@ -3726,53 +3726,6 @@ static void ufs_qcom_register_minidump(uintptr_t vaddr, u64 size,
 	}
 }
 
-static int ufs_qcom_panic_handler(struct notifier_block *nb,
-					unsigned long e, void *p)
-{
-	struct ufs_qcom_host *host = container_of(nb, struct ufs_qcom_host, ufs_qcom_panic_nb);
-	struct ufs_hba *hba = host->hba;
-
-	dev_err(hba->dev, "......dumping ufs info .......\n");
-
-	dev_err(hba->dev, "UFS Host state=%d\n", hba->ufshcd_state);
-	dev_err(hba->dev, "outstanding reqs=0x%lx tasks=0x%lx\n",
-		hba->outstanding_reqs, hba->outstanding_tasks);
-	dev_err(hba->dev, "saved_err=0x%x, saved_uic_err=0x%x\n",
-		hba->saved_err, hba->saved_uic_err);
-	dev_err(hba->dev, "Device power mode=%d, UIC link state=%d\n",
-		hba->curr_dev_pwr_mode, hba->uic_link_state);
-	dev_err(hba->dev, "PM in progress=%d, sys. suspended=%d\n",
-		hba->pm_op_in_progress, hba->is_sys_suspended);
-
-	dev_err(hba->dev, "Clk gate=%d\n", hba->clk_gating.state);
-	dev_err(hba->dev, "last_hibern8_exit_tstamp at %lld us, hibern8_exit_cnt=%d\n",
-		ktime_to_us(hba->ufs_stats.last_hibern8_exit_tstamp),
-		hba->ufs_stats.hibern8_exit_cnt);
-	dev_err(hba->dev, "last intr at %lld us, last intr status=0x%x\n",
-		ktime_to_us(hba->ufs_stats.last_intr_ts),
-		hba->ufs_stats.last_intr_status);
-	dev_err(hba->dev, "error handling flags=0x%x, req. abort count=%d\n",
-		hba->eh_flags, hba->req_abort_count);
-	dev_err(hba->dev, "hba->ufs_version=0x%x, Host capabilities=0x%x, caps=0x%x\n",
-		hba->ufs_version, hba->capabilities, hba->caps);
-	dev_err(hba->dev, "quirks=0x%x, dev. quirks=0x%x\n", hba->quirks,
-		hba->dev_quirks);
-
-	dev_err(hba->dev, "[RX, TX]: gear=[%d, %d], lane[%d, %d], rate = %d\n",
-		hba->pwr_info.gear_rx, hba->pwr_info.gear_tx,
-		hba->pwr_info.lane_rx, hba->pwr_info.lane_tx,
-		hba->pwr_info.hs_rate);
-
-	dev_err(hba->dev, "UFS RPM level = %d\n", hba->rpm_lvl);
-	dev_err(hba->dev, "UFS SPM level = %d\n", hba->spm_lvl);
-
-	dev_err(hba->dev, "host_blocked=%d\n host_failed =%d\n Host self-block=%d\n",
-		hba->host->host_blocked, hba->host->host_failed, hba->host->host_self_blocked);
-	dev_err(hba->dev, "............. ufs dump complete ..........\n");
-
-	return NOTIFY_OK;
-}
-
 static void ufs_qcom_set_rate_a(struct ufs_qcom_host *host)
 {
 	size_t len;
@@ -4986,6 +4939,9 @@ static const struct ufs_hba_variant_ops ufs_hba_qcom_vops = {
 	.setup_xfer_req         = ufs_qcom_qos,
 	.program_key		= ufs_qcom_ice_program_key,
 	.fixup_dev_quirks       = ufs_qcom_fixup_dev_quirks,
+#if IS_ENABLED(CONFIG_QTI_CRYPTO_FDE)
+	.prepare_lrbp_crypto = ufshcd_crypto_qti_prep_lrbp_crypto,
+#endif
 };
 
 /**

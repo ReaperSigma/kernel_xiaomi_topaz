@@ -1163,12 +1163,6 @@ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
 
 	/* Handle message when no fragments remain to be received */
 	if (!left_size) {
-		if (!glink->intentless) {
-			spin_lock_irqsave(&channel->intent_lock, flags);
-			list_add_tail(&intent->node, &channel->defer_intents);
-			spin_unlock_irqrestore(&channel->intent_lock, flags);
-		}
-
 		spin_lock_irqsave(&channel->recv_lock, flags);
 		if (channel->ept.cb) {
 			ret = channel->ept.cb(channel->ept.rpdev,
@@ -1274,11 +1268,6 @@ static int qcom_glink_rx_data_zero_copy(struct qcom_glink *glink, size_t avail)
 
 	intent->data = data;
 	intent->offset = len;
-
-	spin_lock_irqsave(&channel->intent_lock, flags);
-	list_add_tail(&intent->node, &channel->defer_intents);
-	spin_unlock_irqrestore(&channel->intent_lock, flags);
-
 	spin_lock_irqsave(&channel->recv_lock, flags);
 	if (channel->ept.cb) {
 		ret = channel->ept.cb(channel->ept.rpdev, intent->data,
